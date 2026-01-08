@@ -178,9 +178,11 @@ struct RegionSelectorOverlay: View {
                 // Instructions
                 VStack {
                     if !controller.isAdjusting && !controller.isDragging {
-                        InstructionBadge(text: "DRAG TO SELECT RECORDING AREA", icon: "rectangle.dashed")
+                        InstructionBadge(text: "ドラッグで範囲を選択 (ESCでキャンセル)", icon: "rectangle.dashed")
                     } else if controller.isDragging {
-                        InstructionBadge(text: "RELEASE TO SET AREA", icon: "hand.draw")
+                        InstructionBadge(text: "離して範囲を確定", icon: "hand.draw")
+                    } else if controller.isAdjusting {
+                        InstructionBadge(text: "Enterで録画開始 / ESCでキャンセル", icon: "keyboard")
                     }
                     Spacer()
                 }
@@ -196,6 +198,7 @@ struct RegionSelectorOverlay: View {
                                 .foregroundStyle(.white.opacity(0.8))
                         }
                         .buttonStyle(.plain)
+                        .keyboardShortcut(.escape, modifiers: [])
                         .padding(20)
                     }
                     Spacer()
@@ -295,25 +298,26 @@ struct SelectionRectView: View {
                     HandleView(position: CGPoint(x: rect.maxX, y: rect.midY), isEdge: true)
                 }
 
-                // Confirm button
+                // Confirm button (inside the selection)
                 Button(action: { controller.confirm() }) {
                     HStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 18))
-                        Text("START RECORDING")
+                        Image(systemName: "video.fill")
+                            .font(.system(size: 16))
+                        Text("録画開始")
                             .font(.system(size: 14, weight: .bold, design: .rounded))
                     }
                     .foregroundColor(.white)
                     .padding(.vertical, 12)
                     .padding(.horizontal, 24)
                     .background(
-                        LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing)
+                        LinearGradient(colors: [.red, .orange], startPoint: .leading, endPoint: .trailing)
                     )
                     .clipShape(Capsule())
-                    .shadow(color: .blue.opacity(0.5), radius: 10, y: 5)
+                    .shadow(color: .red.opacity(0.5), radius: 10, y: 5)
                 }
                 .buttonStyle(.plain)
-                .position(x: rect.midX, y: rect.maxY + 40)
+                .keyboardShortcut(.return, modifiers: [])
+                .position(x: rect.midX, y: rect.midY)
             }
         }
         .gesture(
