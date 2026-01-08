@@ -38,17 +38,23 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     // Zoom & Region settings
     private(set) var zoomScale: CGFloat = 2.0
     private(set) var baseRegion: CGRect? // nil means full screen
-    
+    var zoomSettings = ZoomSettings()
+
     // Zoom Logic Internals
     private var lastTargetPosition: CGPoint = .zero
+    private var lockedTargetPosition: CGPoint = .zero  // Position that zoom is locked to
     private var currentSourceRect: CGRect = .zero
     private var displaySize: CGSize = .zero
     private var currentSmoothScale: CGFloat = 1.0
     private var isTypingDetected = false
-    
+    private var lastTypingDetectedTime: Date = .distantPast
+    private var lastPositionChangeTime: Date = .distantPast
+    private var isZoomActive = false  // Whether zoom is currently engaged
+
     // Timers & Windows
     private var timer: Timer?
     private var overlayWindow: NSWindow?
+    private var overlayViewModel: OverlayViewModel?
     private var dimmingWindow: NSWindow?
     private var dimmingViewModel: DimmingViewModel?
     private var lastUpdateTimestamp: Date = .distantPast
@@ -100,18 +106,24 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             // Reset Zoom State
             currentSmoothScale = 1.0
             isTypingDetected = false
+            isZoomActive = false
+            lastTypingDetectedTime = .distantPast
+            lastPositionChangeTime = .distantPast
             currentSourceRect = CGRect(origin: .zero, size: displaySize)
 
             // Initialize lastTargetPosition based on baseRegion or screen center
+            let initialPosition: CGPoint
             if let region = baseRegion {
                 // baseRegion is in NSWindow coordinates (bottom-left origin)
                 // Convert center to top-left origin
                 let centerX = region.midX
                 let centerY = displaySize.height - region.midY
-                lastTargetPosition = CGPoint(x: centerX, y: centerY)
+                initialPosition = CGPoint(x: centerX, y: centerY)
             } else {
-                lastTargetPosition = CGPoint(x: displaySize.width / 2, y: displaySize.height / 2)
+                initialPosition = CGPoint(x: displaySize.width / 2, y: displaySize.height / 2)
             }
+            lastTargetPosition = initialPosition
+            lockedTargetPosition = initialPosition
 
             // Setup Asset Writer
             try setupAssetWriter(width: config.width, height: config.height)
@@ -306,7 +318,11 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.isReleasedWhenClosed = false // Prevent double-free crash
 
-        let contentView = NSHostingView(rootView: RecordingOverlayView(scale: zoomScale))
+        let viewModel = OverlayViewModel()
+        viewModel.edgeMargin = zoomSettings.edgeMarginRatio
+        self.overlayViewModel = viewModel
+
+        let contentView = NSHostingView(rootView: DynamicRecordingOverlayView(viewModel: viewModel))
         window.contentView = contentView
         self.overlayWindow = window
     }
@@ -342,6 +358,7 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     private func cleanupWindows() {
         overlayWindow?.close()
         overlayWindow = nil
+        overlayViewModel = nil
         dimmingWindow?.close()
         dimmingWindow = nil
         dimmingViewModel = nil
@@ -377,40 +394,26 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     private var lastLogTime: Date = .distantPast
 
     private func updateZoom() {
+        let now = Date()
+        let settings = zoomSettings
         let typingPosition = AccessibilityUtils.getTypingCursorPosition()
 
-        let targetScale: CGFloat
-        var targetX: CGFloat
-        var targetY: CGFloat
-
-        // Debug log (throttled to once per second)
-        #if DEBUG
-        if Date().timeIntervalSince(lastLogTime) > 1.0 {
-            if let pos = typingPosition {
-                print("[Zoom] Typing detected at: \(pos), scale: \(currentSmoothScale)")
-            } else {
-                print("[Zoom] No typing detected, scale: \(currentSmoothScale)")
-            }
-            lastLogTime = Date()
-        }
-        #endif
-
         // Calculate default center position (in top-left origin coordinates)
-        let defaultCenterX: CGFloat
-        let defaultCenterY: CGFloat
+        let defaultCenter: CGPoint
         if let region = baseRegion {
             // baseRegion is in NSWindow coordinates (bottom-left origin)
             // Convert to top-left origin
-            defaultCenterX = region.midX
-            defaultCenterY = displaySize.height - region.midY
+            defaultCenter = CGPoint(x: region.midX, y: displaySize.height - region.midY)
         } else {
-            defaultCenterX = displaySize.width / 2
-            defaultCenterY = displaySize.height / 2
+            defaultCenter = CGPoint(x: displaySize.width / 2, y: displaySize.height / 2)
         }
 
+        // Determine if typing is detected and within region
+        var newTypingDetected = false
+        var detectedPosition: CGPoint? = nil
+
         if let typingPos = typingPosition {
-            // Accessibility coordinates are screen coordinates (top-left origin)
-            // Check if typing position is within baseRegion (need to convert baseRegion to top-left)
+            // Check if typing position is within baseRegion
             let isInRegion: Bool
             if let region = baseRegion {
                 let regionTopLeft = CGRect(
@@ -425,30 +428,133 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             }
 
             if isInRegion {
-                targetScale = zoomScale
-                targetX = typingPos.x
-                targetY = typingPos.y
-                isTypingDetected = true
-            } else {
-                targetScale = 1.0
-                targetX = defaultCenterX
-                targetY = defaultCenterY
-                isTypingDetected = false
+                newTypingDetected = true
+                detectedPosition = typingPos
             }
+        }
+
+        // Update typing detection timestamp
+        if newTypingDetected {
+            lastTypingDetectedTime = now
+        }
+
+        // Determine if zoom should be active (with hold duration)
+        let timeSinceLastTyping = now.timeIntervalSince(lastTypingDetectedTime)
+        let shouldZoom = newTypingDetected || (timeSinceLastTyping < settings.zoomHoldDuration && isZoomActive)
+
+        // Update zoom active state
+        if newTypingDetected && !isZoomActive {
+            // Starting zoom - lock to current position
+            isZoomActive = true
+            if let pos = detectedPosition {
+                lockedTargetPosition = pos
+                lastPositionChangeTime = now
+            }
+        } else if !shouldZoom && isZoomActive {
+            // Ending zoom
+            isZoomActive = false
+        }
+
+        // Handle position updates based on edge margin
+        // Only reposition when cursor approaches the edge of the current zoom area
+        if let pos = detectedPosition, isZoomActive {
+            let timeSinceLastMove = now.timeIntervalSince(lastPositionChangeTime)
+
+            // Calculate current zoom area dimensions
+            let baseWidth: CGFloat
+            let baseHeight: CGFloat
+            if let region = baseRegion {
+                baseWidth = region.width
+                baseHeight = region.height
+            } else {
+                baseWidth = displaySize.width
+                baseHeight = displaySize.height
+            }
+            let zoomWidth = baseWidth / settings.zoomScale
+            let zoomHeight = baseHeight / settings.zoomScale
+
+            // Calculate current zoom area bounds (centered on lockedTargetPosition)
+            let currentZoomLeft = lockedTargetPosition.x - zoomWidth / 2
+            let currentZoomRight = lockedTargetPosition.x + zoomWidth / 2
+            let currentZoomTop = lockedTargetPosition.y - zoomHeight / 2
+            let currentZoomBottom = lockedTargetPosition.y + zoomHeight / 2
+
+            // Calculate margin in points
+            let marginX = zoomWidth * settings.edgeMarginRatio
+            let marginY = zoomHeight * settings.edgeMarginRatio
+
+            // Check if cursor is within the edge margin (about to go out of view)
+            let nearLeftEdge = pos.x < currentZoomLeft + marginX
+            let nearRightEdge = pos.x > currentZoomRight - marginX
+            let nearTopEdge = pos.y < currentZoomTop + marginY
+            let nearBottomEdge = pos.y > currentZoomBottom - marginY
+
+            let isNearEdge = nearLeftEdge || nearRightEdge || nearTopEdge || nearBottomEdge
+
+            // Also check minimum movement threshold to avoid micro-adjustments
+            let distance = hypot(pos.x - lockedTargetPosition.x, pos.y - lockedTargetPosition.y)
+            let exceedsThreshold = distance > settings.movementThreshold
+
+            // Reposition if:
+            // 1. Cursor is near edge of zoom area, OR cursor moved significantly
+            // 2. Enough time has passed since last reposition
+            if (isNearEdge || exceedsThreshold) && timeSinceLastMove > settings.positionHoldDuration {
+                lockedTargetPosition = pos
+                lastPositionChangeTime = now
+            }
+        }
+
+        // Determine target scale and position
+        let targetScale: CGFloat
+        var targetPosition: CGPoint
+
+        if shouldZoom {
+            targetScale = settings.zoomScale
+            // Apply center offset to the locked position
+            // Offset moves the zoom center relative to cursor position
+            let baseWidth: CGFloat
+            let baseHeight: CGFloat
+            if let region = baseRegion {
+                baseWidth = region.width
+                baseHeight = region.height
+            } else {
+                baseWidth = displaySize.width
+                baseHeight = displaySize.height
+            }
+            let zoomWidth = baseWidth / settings.zoomScale
+            let zoomHeight = baseHeight / settings.zoomScale
+
+            // Apply offset: positive X moves zoom right (cursor appears more to the left)
+            // positive Y moves zoom down (cursor appears more to the top)
+            let offsetX = zoomWidth * settings.centerOffsetX
+            let offsetY = zoomHeight * settings.centerOffsetY
+            targetPosition = CGPoint(
+                x: lockedTargetPosition.x + offsetX,
+                y: lockedTargetPosition.y + offsetY
+            )
+            isTypingDetected = true
         } else {
             targetScale = 1.0
-            targetX = defaultCenterX
-            targetY = defaultCenterY
+            targetPosition = defaultCenter
             isTypingDetected = false
         }
 
-        // Smooth interpolation
-        let scaleSmoothing: CGFloat = 0.08
-        let posSmoothing: CGFloat = 0.12
+        // Debug log (throttled)
+        #if DEBUG
+        if now.timeIntervalSince(lastLogTime) > 1.0 {
+            if shouldZoom {
+                print("[Zoom] Active at: \(lockedTargetPosition), scale: \(currentSmoothScale), hold: \(timeSinceLastTyping)s")
+            } else {
+                print("[Zoom] Inactive, scale: \(currentSmoothScale)")
+            }
+            lastLogTime = now
+        }
+        #endif
 
-        currentSmoothScale += (targetScale - currentSmoothScale) * scaleSmoothing
-        lastTargetPosition.x += (targetX - lastTargetPosition.x) * posSmoothing
-        lastTargetPosition.y += (targetY - lastTargetPosition.y) * posSmoothing
+        // Smooth interpolation with configurable smoothing
+        currentSmoothScale += (targetScale - currentSmoothScale) * settings.scaleSmoothing
+        lastTargetPosition.x += (targetPosition.x - lastTargetPosition.x) * settings.positionSmoothing
+        lastTargetPosition.y += (targetPosition.y - lastTargetPosition.y) * settings.positionSmoothing
 
         // Calculate zoom area size based on baseRegion if set, otherwise full screen
         let baseWidth: CGFloat
@@ -477,7 +583,6 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
         currentSourceRect = newSourceRect
 
         // Update Overlay Window and Dimming
-        // NSWindow frame uses bottom-left origin, so we need to convert Y
         if let screen = NSScreen.main {
             let screenHeight = screen.frame.height
             // Convert from top-left to bottom-left origin for window positioning
@@ -486,18 +591,27 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             // Update overlay window
             if let window = self.overlayWindow {
                 window.setFrame(NSRect(x: sourceX, y: windowY, width: activeZoomWidth, height: activeZoomHeight), display: true)
-                window.alphaValue = self.isTypingDetected ? 1.0 : 0.0
+                window.alphaValue = (settings.showOverlay && isZoomActive) ? 1.0 : 0.0
             }
 
-            // Update dimming hole rect (SwiftUI uses top-left origin within the window)
-            // The dimming window covers the full screen, so we use sourceX/sourceY directly
+            // Update overlay view model with current edge margin
+            if let viewModel = self.overlayViewModel {
+                viewModel.edgeMargin = settings.edgeMarginRatio
+            }
+
+            // Update dimming hole rect
             if let viewModel = self.dimmingViewModel {
-                viewModel.holeRect = CGRect(x: sourceX, y: sourceY, width: activeZoomWidth, height: activeZoomHeight)
+                if settings.showDimming {
+                    viewModel.holeRect = CGRect(x: sourceX, y: sourceY, width: activeZoomWidth, height: activeZoomHeight)
+                } else {
+                    // No dimming - hole covers entire screen
+                    viewModel.holeRect = CGRect(origin: .zero, size: screen.frame.size)
+                }
             }
         }
 
         // Stream Update (throttled to avoid too many config updates)
-        if Date().timeIntervalSince(lastUpdateTimestamp) > 0.033 { // ~30fps for config updates
+        if now.timeIntervalSince(lastUpdateTimestamp) > 0.033 { // ~30fps for config updates
             if let stream = stream {
                 let config = SCStreamConfiguration()
                 config.sourceRect = currentSourceRect
@@ -510,7 +624,7 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
                     }
                 }
             }
-            lastUpdateTimestamp = Date()
+            lastUpdateTimestamp = now
         }
     }
 
@@ -572,6 +686,20 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
 extension ScreenRecorder: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         print("Stream stop error: \(error)")
+    }
+}
+
+// MARK: - Overlay View Model
+class OverlayViewModel: ObservableObject {
+    @Published var edgeMargin: CGFloat = 0.1
+}
+
+// MARK: - Dynamic Recording Overlay View
+struct DynamicRecordingOverlayView: View {
+    @ObservedObject var viewModel: OverlayViewModel
+
+    var body: some View {
+        RecordingOverlayView(scale: 1.0, edgeMargin: viewModel.edgeMargin)
     }
 }
 

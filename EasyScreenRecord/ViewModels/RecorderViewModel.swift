@@ -11,13 +11,15 @@ class RecorderViewModel: ObservableObject {
     @Published var zoomScale: CGFloat = 2.0 {
         didSet {
             recorder.setZoomScale(zoomScale)
+            recorder.zoomSettings.zoomScale = zoomScale
         }
     }
-    
+
     private var selectionWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
-    
+
     init() {
+        // Sync recorder state to isRecording
         recorder.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
@@ -28,6 +30,16 @@ class RecorderViewModel: ObservableObject {
                     self?.isRecording = true
                 } else {
                     self?.isRecording = false
+                }
+            }
+            .store(in: &cancellables)
+
+        // Sync ZoomSettings.zoomScale back to viewModel
+        recorder.zoomSettings.$zoomScale
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] scale in
+                if self?.zoomScale != scale {
+                    self?.zoomScale = scale
                 }
             }
             .store(in: &cancellables)
