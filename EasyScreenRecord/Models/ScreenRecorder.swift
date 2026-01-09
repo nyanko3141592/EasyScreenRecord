@@ -371,10 +371,10 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
         self.pixelBufferAdaptor = adaptor
     }
     
-    private func setupOverlayWindow() {
-        // Red frame window
+    /// Create a transparent overlay window with standard configuration
+    private func createOverlayWindow(frame: NSRect) -> NSWindow {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            contentRect: frame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -384,21 +384,24 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
         window.ignoresMouseEvents = true
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.isReleasedWhenClosed = false // Prevent double-free crash
+        window.isReleasedWhenClosed = false
+        return window
+    }
+
+    private func setupOverlayWindow() {
+        let window = createOverlayWindow(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
 
         let viewModel = OverlayViewModel()
         viewModel.edgeMargin = zoomSettings.edgeMarginRatio
         viewModel.showSafeZone = zoomSettings.showSafeZone
         self.overlayViewModel = viewModel
 
-        let contentView = NSHostingView(rootView: DynamicRecordingOverlayView(viewModel: viewModel))
-        window.contentView = contentView
+        window.contentView = NSHostingView(rootView: DynamicRecordingOverlayView(viewModel: viewModel))
         self.overlayWindow = window
     }
-    
+
     /// Get the screen containing the recording region
     private func getTargetScreen() -> NSScreen {
-        // If we have a baseRegion, find the screen that contains it
         if let region = baseRegion {
             let regionCenter = CGPoint(x: region.midX, y: region.midY)
             for screen in NSScreen.screens {
@@ -412,71 +415,34 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
 
     private func setupDimmingWindow() {
         let screen = getTargetScreen()
+        let window = createOverlayWindow(frame: screen.frame)
 
-        // Create a full screen window with a dynamic 'hole'
-        let window = NSWindow(
-            contentRect: screen.frame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.ignoresMouseEvents = true
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.isReleasedWhenClosed = false // Prevent double-free crash
-
-        // Create view model for dynamic updates
         let viewModel = DimmingViewModel()
-        self.dimmingViewModel = viewModel
-
-        // Initialize hole rect to full screen (no dimming initially)
-        // Use local coordinates (relative to window/screen origin)
         viewModel.holeRect = CGRect(origin: .zero, size: screen.frame.size)
         viewModel.screenOrigin = screen.frame.origin
+        self.dimmingViewModel = viewModel
 
-        let contentView = NSHostingView(rootView: DimmingView(viewModel: viewModel))
-        window.contentView = contentView
+        window.contentView = NSHostingView(rootView: DimmingView(viewModel: viewModel))
         self.dimmingWindow = window
     }
-    
+
     private func setupSubtitleWindow() {
         let targetScreen = getTargetScreen()
+        let regionFrame = baseRegion ?? targetScreen.frame
 
-        // Use baseRegion if set, otherwise use full screen
-        let regionFrame: CGRect
-        if let region = baseRegion {
-            regionFrame = region
-        } else {
-            regionFrame = targetScreen.frame
-        }
-
-        // Create subtitle window - visible above dimming, within recording region
-        let window = NSWindow(
-            contentRect: CGRect(x: regionFrame.origin.x,
-                              y: regionFrame.origin.y,
-                              width: regionFrame.width,
-                              height: 80),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.ignoresMouseEvents = true
-        // Use .floating level to appear above dimming window
-        window.level = .floating
-        window.isReleasedWhenClosed = false
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let window = createOverlayWindow(frame: CGRect(
+            x: regionFrame.origin.x,
+            y: regionFrame.origin.y,
+            width: regionFrame.width,
+            height: 80
+        ))
 
         let viewModel = SubtitleViewModel()
         viewModel.fontSize = zoomSettings.subtitleFontSize
         viewModel.backgroundOpacity = zoomSettings.subtitleBackgroundOpacity
         self.subtitleViewModel = viewModel
 
-        let contentView = NSHostingView(rootView: SubtitleView(viewModel: viewModel))
-        window.contentView = contentView
+        window.contentView = NSHostingView(rootView: SubtitleView(viewModel: viewModel))
         self.subtitleWindow = window
     }
 
@@ -530,7 +496,265 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     }
     
     // MARK: - Zoom Logic
-    
+
+    // MARK: Zoom Helper Types
+
+    private struct ZoomTriggerResult {
+        var isTriggered: Bool = false
+        var position: CGPoint? = nil
+        var source: String = ""
+    }
+
+    private struct ZoomParameters {
+        var targetScale: CGFloat
+        var targetPosition: CGPoint
+        var zoomWidth: CGFloat
+        var zoomHeight: CGFloat
+        var shouldZoom: Bool
+    }
+
+    // MARK: Zoom Helper Methods
+
+    /// Calculate the default center position (in display-local top-left origin coordinates)
+    private func calculateDefaultCenter() -> CGPoint {
+        if let region = baseRegion {
+            let localX = region.midX - displayOrigin.x
+            let localY = displaySize.height - (region.midY - displayOrigin.y)
+            return CGPoint(x: localX, y: localY)
+        }
+        return CGPoint(x: displaySize.width / 2, y: displaySize.height / 2)
+    }
+
+    /// Check if a position is within the recording region
+    private func isPositionInRegion(_ globalPos: CGPoint) -> (isInRegion: Bool, localPos: CGPoint) {
+        let localPos = CGPoint(
+            x: globalPos.x - displayOrigin.x,
+            y: globalPos.y - displayOrigin.y
+        )
+
+        let displayBounds = CGRect(origin: .zero, size: displaySize)
+        let isInDisplay = displayBounds.contains(localPos)
+
+        let isInRegion: Bool
+        if let region = baseRegion {
+            let regionTopLeft = CGRect(
+                x: region.origin.x - displayOrigin.x,
+                y: displaySize.height - (region.origin.y - displayOrigin.y) - region.height,
+                width: region.width,
+                height: region.height
+            )
+            isInRegion = regionTopLeft.contains(localPos)
+        } else {
+            isInRegion = isInDisplay
+        }
+
+        return (isInRegion, localPos)
+    }
+
+    /// Detect zoom triggers (typing, double-click, text selection)
+    private func detectZoomTrigger(settings: ZoomSettings) -> ZoomTriggerResult {
+        var result = ZoomTriggerResult()
+
+        // 1. Check typing trigger
+        if settings.zoomOnTyping {
+            if let typingPos = AccessibilityUtils.getTypingCursorPosition() {
+                let (isInRegion, localPos) = isPositionInRegion(typingPos)
+                if isInRegion {
+                    result = ZoomTriggerResult(isTriggered: true, position: localPos, source: "typing")
+                    return result
+                }
+            }
+        }
+
+        // 2. Check double-click trigger
+        if settings.zoomOnDoubleClick {
+            if InputMonitor.shared.isDoubleClickActive(within: settings.zoomHoldDuration) {
+                if let doubleClickPos = InputMonitor.shared.getDoubleClickPosition() {
+                    let (isInRegion, localPos) = isPositionInRegion(doubleClickPos)
+                    if isInRegion {
+                        result = ZoomTriggerResult(isTriggered: true, position: localPos, source: "doubleClick")
+                        return result
+                    }
+                }
+            }
+        }
+
+        // 3. Check text selection trigger
+        if settings.zoomOnTextSelection {
+            if InputMonitor.shared.isTextSelectionActive(within: settings.zoomHoldDuration) {
+                if let selectionPos = AccessibilityUtils.getFocusedElementPosition() {
+                    let (isInRegion, localPos) = isPositionInRegion(selectionPos)
+                    if isInRegion {
+                        result = ZoomTriggerResult(isTriggered: true, position: localPos, source: "textSelection")
+                        return result
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Calculate zoom parameters based on current state
+    private func calculateZoomParameters(
+        settings: ZoomSettings,
+        shouldZoom: Bool,
+        defaultCenter: CGPoint
+    ) -> ZoomParameters {
+        let baseWidth = baseRegion?.width ?? displaySize.width
+        let baseHeight = baseRegion?.height ?? displaySize.height
+
+        let targetScale: CGFloat
+        let targetZoomWidth: CGFloat
+        let targetZoomHeight: CGFloat
+        var targetPosition: CGPoint
+
+        if shouldZoom {
+            switch settings.zoomMode {
+            case .scale:
+                targetScale = max(settings.minZoomScale, min(settings.maxZoomScale, settings.zoomScale))
+                targetZoomWidth = baseWidth / targetScale
+                targetZoomHeight = baseHeight / targetScale
+
+            case .frameSize:
+                targetZoomWidth = min(settings.zoomFrameWidth, baseWidth)
+                targetZoomHeight = min(settings.zoomFrameHeight, baseHeight)
+                targetScale = baseWidth / targetZoomWidth
+            }
+
+            let offsetX = targetZoomWidth * settings.centerOffsetX
+            let offsetY = targetZoomHeight * settings.centerOffsetY
+            targetPosition = CGPoint(
+                x: lockedTargetPosition.x + offsetX,
+                y: lockedTargetPosition.y + offsetY
+            )
+        } else {
+            targetScale = 1.0
+            targetZoomWidth = baseWidth
+            targetZoomHeight = baseHeight
+            targetPosition = defaultCenter
+        }
+
+        return ZoomParameters(
+            targetScale: targetScale,
+            targetPosition: targetPosition,
+            zoomWidth: targetZoomWidth,
+            zoomHeight: targetZoomHeight,
+            shouldZoom: shouldZoom
+        )
+    }
+
+    /// Update overlay and dimming windows
+    private func updateOverlayAndDimming(
+        sourceRect: CGRect,
+        isZoomActive: Bool,
+        settings: ZoomSettings
+    ) {
+        let targetScreen = getTargetScreen()
+        let screenHeight = targetScreen.frame.height
+        let screenOrigin = targetScreen.frame.origin
+
+        let windowY = screenOrigin.y + screenHeight - sourceRect.origin.y - sourceRect.height
+
+        // Update overlay window
+        if let window = self.overlayWindow {
+            window.setFrame(NSRect(
+                x: sourceRect.origin.x,
+                y: windowY,
+                width: sourceRect.width,
+                height: sourceRect.height
+            ), display: true)
+            window.alphaValue = (settings.showOverlay && isZoomActive) ? 1.0 : 0.0
+        }
+
+        // Update overlay view model
+        if let viewModel = self.overlayViewModel {
+            viewModel.edgeMargin = settings.edgeMarginRatio
+            viewModel.showSafeZone = settings.showSafeZone
+        }
+
+        // Update dimming
+        if let viewModel = self.dimmingViewModel {
+            if settings.showDimming && isZoomActive {
+                viewModel.holeRect = sourceRect
+            } else if settings.showDimming {
+                if let region = baseRegion {
+                    let localX = region.origin.x - screenOrigin.x
+                    let localY = screenHeight - (region.origin.y - screenOrigin.y) - region.height
+                    viewModel.holeRect = CGRect(x: localX, y: localY, width: region.width, height: region.height)
+                } else {
+                    viewModel.holeRect = CGRect(origin: .zero, size: targetScreen.frame.size)
+                }
+            } else {
+                viewModel.holeRect = CGRect(origin: .zero, size: targetScreen.frame.size)
+            }
+        }
+    }
+
+    /// Update stream configuration
+    private func updateStreamConfig(sourceRect: CGRect, showCursor: Bool) {
+        guard let stream = stream else { return }
+
+        let config = SCStreamConfiguration()
+        config.sourceRect = sourceRect
+        config.width = Int(displaySize.width) * 2
+        config.height = Int(displaySize.height) * 2
+        config.showsCursor = showCursor
+
+        stream.updateConfiguration(config) { error in
+            if let error = error {
+                print("Failed to update stream configuration: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Update subtitle display
+    private func updateSubtitleDisplay(settings: ZoomSettings, sourceRect: CGRect, now: Date) {
+        guard settings.subtitlesEnabled, let viewModel = subtitleViewModel else { return }
+
+        if let typedText = InputMonitor.shared.getTypedBuffer() {
+            if typedText != lastSubtitleText {
+                lastSubtitleText = typedText
+                viewModel.text = typedText
+            }
+            lastSubtitleUpdateTime = now
+            viewModel.isVisible = true
+        }
+
+        let timeSinceLastUpdate = now.timeIntervalSince(lastSubtitleUpdateTime)
+        if timeSinceLastUpdate > settings.subtitleDisplayDuration && viewModel.isVisible {
+            viewModel.isVisible = false
+            lastSubtitleText = ""
+            InputMonitor.shared.clearTypedBuffer()
+        }
+
+        viewModel.fontSize = settings.subtitleFontSize
+        viewModel.backgroundOpacity = settings.subtitleBackgroundOpacity
+
+        // Update subtitle window position
+        if let window = subtitleWindow {
+            let targetScreen = getTargetScreen()
+            let screenHeight = targetScreen.frame.height
+            let screenOrigin = targetScreen.frame.origin
+            let subtitleHeight: CGFloat = 80
+            let margin: CGFloat = 10
+
+            let subtitleY: CGFloat
+            if settings.subtitlePosition == 0 {
+                subtitleY = screenOrigin.y + screenHeight - sourceRect.origin.y - sourceRect.height + margin
+            } else {
+                subtitleY = screenOrigin.y + screenHeight - sourceRect.origin.y - subtitleHeight - margin
+            }
+
+            window.setFrame(CGRect(
+                x: screenOrigin.x + sourceRect.origin.x,
+                y: subtitleY,
+                width: sourceRect.width,
+                height: subtitleHeight
+            ), display: false)
+        }
+    }
+
     private func startZoomTimer() {
         // Ensure timer runs on main thread for UI updates
         DispatchQueue.main.async { [weak self] in
@@ -554,221 +778,65 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     private func updateZoom() {
         let now = Date()
         let settings = zoomSettings
+        let defaultCenter = calculateDefaultCenter()
 
-        // If smart zoom is disabled, just maintain current view without zoom changes
+        // Handle smart zoom disabled case
         if !settings.smartZoomEnabled {
-            // Update stream with current (non-zoomed) view
             if now.timeIntervalSince(lastUpdateTimestamp) > 0.033 {
-                if let stream = stream {
-                    let config = SCStreamConfiguration()
-                    config.sourceRect = CGRect(origin: .zero, size: displaySize)
-                    config.width = Int(displaySize.width) * 2
-                    config.height = Int(displaySize.height) * 2
-                    config.showsCursor = settings.showCursor
-                    stream.updateConfiguration(config) { error in
-                        if let error = error {
-                            print("Failed to update stream configuration: \(error.localizedDescription)")
-                        }
-                    }
-                }
+                updateStreamConfig(sourceRect: CGRect(origin: .zero, size: displaySize), showCursor: settings.showCursor)
                 lastUpdateTimestamp = now
             }
-            // Hide overlay when smart zoom is disabled
             overlayWindow?.alphaValue = 0.0
-
-            // Still show dimming for the recording region
-            let targetScreen = getTargetScreen()
-            let screenHeight = targetScreen.frame.height
-            let screenOrigin = targetScreen.frame.origin
-            if let viewModel = dimmingViewModel {
-                if settings.showDimming, let region = baseRegion {
-                    let localX = region.origin.x - screenOrigin.x
-                    let localY = screenHeight - (region.origin.y - screenOrigin.y) - region.height
-                    viewModel.holeRect = CGRect(x: localX, y: localY, width: region.width, height: region.height)
-                } else {
-                    viewModel.holeRect = CGRect(origin: .zero, size: targetScreen.frame.size)
-                }
-            }
+            updateOverlayAndDimming(
+                sourceRect: CGRect(origin: .zero, size: displaySize),
+                isZoomActive: false,
+                settings: settings
+            )
             return
         }
 
-        // Calculate default center position (in display-local top-left origin coordinates)
-        let defaultCenter: CGPoint
-        if let region = baseRegion {
-            // baseRegion is in NSWindow global coordinates (bottom-left origin)
-            // Convert to display-local top-left origin
-            let localX = region.midX - displayOrigin.x
-            let localY = displaySize.height - (region.midY - displayOrigin.y)
-            defaultCenter = CGPoint(x: localX, y: localY)
-        } else {
-            defaultCenter = CGPoint(x: displaySize.width / 2, y: displaySize.height / 2)
-        }
-
-        // Helper function to check if a position is within recording region
-        func isPositionInRegion(_ globalPos: CGPoint) -> (isInRegion: Bool, localPos: CGPoint) {
-            // Convert global coordinates to display-local coordinates
-            let localPos = CGPoint(
-                x: globalPos.x - displayOrigin.x,
-                y: globalPos.y - displayOrigin.y
-            )
-
-            // Check if within display bounds
-            let displayBounds = CGRect(origin: .zero, size: displaySize)
-            let isInDisplay = displayBounds.contains(localPos)
-
-            // Check if within baseRegion (if set)
-            let isInRegion: Bool
-            if let region = baseRegion {
-                // baseRegion is in NSWindow coordinates (bottom-left origin)
-                // Convert to top-left origin for comparison
-                let regionTopLeft = CGRect(
-                    x: region.origin.x - displayOrigin.x,
-                    y: displaySize.height - (region.origin.y - displayOrigin.y) - region.height,
-                    width: region.width,
-                    height: region.height
-                )
-                isInRegion = regionTopLeft.contains(localPos)
-            } else {
-                isInRegion = isInDisplay
-            }
-
-            return (isInRegion, localPos)
-        }
-
-        // Determine if any zoom trigger is active
-        var newZoomTriggerDetected = false
-        var detectedPosition: CGPoint? = nil
-        var triggerSource: String = ""
-
-        // 1. Check typing trigger
-        if settings.zoomOnTyping {
-            if let typingPos = AccessibilityUtils.getTypingCursorPosition() {
-                let (isInRegion, localPos) = isPositionInRegion(typingPos)
-                if isInRegion {
-                    newZoomTriggerDetected = true
-                    detectedPosition = localPos
-                    triggerSource = "typing"
-                }
-            }
-        }
-
-        // 2. Check double-click trigger (only if not already triggered)
-        if !newZoomTriggerDetected && settings.zoomOnDoubleClick {
-            if InputMonitor.shared.isDoubleClickActive(within: settings.zoomHoldDuration) {
-                if let doubleClickPos = InputMonitor.shared.getDoubleClickPosition() {
-                    let (isInRegion, localPos) = isPositionInRegion(doubleClickPos)
-                    if isInRegion {
-                        newZoomTriggerDetected = true
-                        detectedPosition = localPos
-                        triggerSource = "doubleClick"
-                    }
-                }
-            }
-        }
-
-        // 3. Check text selection trigger (only if not already triggered)
-        if !newZoomTriggerDetected && settings.zoomOnTextSelection {
-            if InputMonitor.shared.isTextSelectionActive(within: settings.zoomHoldDuration) {
-                // Use focused element position for text selection
-                if let selectionPos = AccessibilityUtils.getFocusedElementPosition() {
-                    let (isInRegion, localPos) = isPositionInRegion(selectionPos)
-                    if isInRegion {
-                        newZoomTriggerDetected = true
-                        detectedPosition = localPos
-                        triggerSource = "textSelection"
-                    }
-                }
-            }
-        }
+        // Detect zoom triggers
+        let trigger = detectZoomTrigger(settings: settings)
 
         #if DEBUG
-        if newZoomTriggerDetected && now.timeIntervalSince(lastLogTime) > 1.0 {
-            print("[Zoom] Trigger: \(triggerSource), position: \(detectedPosition ?? .zero)")
+        if trigger.isTriggered && now.timeIntervalSince(lastLogTime) > 1.0 {
+            print("[Zoom] Trigger: \(trigger.source), position: \(trigger.position ?? .zero)")
             lastLogTime = now
         }
         #endif
 
-        // Update zoom trigger detection timestamp
-        if newZoomTriggerDetected {
+        // Update trigger timestamp
+        if trigger.isTriggered {
             lastTypingDetectedTime = now
         }
 
-        // Determine if zoom should be active (with hold duration)
+        // Determine if zoom should be active
         let timeSinceLastTrigger = now.timeIntervalSince(lastTypingDetectedTime)
-        let shouldZoom = newZoomTriggerDetected || (timeSinceLastTrigger < settings.zoomHoldDuration && isZoomActive)
+        let shouldZoom = trigger.isTriggered || (timeSinceLastTrigger < settings.zoomHoldDuration && isZoomActive)
 
         // Update zoom active state
-        if newZoomTriggerDetected && !isZoomActive {
-            // Starting zoom - lock to current position
+        if trigger.isTriggered && !isZoomActive {
             isZoomActive = true
-            if let pos = detectedPosition {
+            if let pos = trigger.position {
                 lockedTargetPosition = pos
                 lastPositionChangeTime = now
             }
         } else if !shouldZoom && isZoomActive {
-            // Ending zoom
             isZoomActive = false
         }
 
-        // Store detected position for edge margin check after smoothing
-        let edgeCheckPosition = detectedPosition
+        // Calculate zoom parameters
+        let params = calculateZoomParameters(settings: settings, shouldZoom: shouldZoom, defaultCenter: defaultCenter)
+        isTypingDetected = shouldZoom
 
-        // Calculate base dimensions (recording area or full screen)
-        let baseWidth: CGFloat
-        let baseHeight: CGFloat
-        if let region = baseRegion {
-            baseWidth = region.width
-            baseHeight = region.height
-        } else {
-            baseWidth = displaySize.width
-            baseHeight = displaySize.height
-        }
+        // Smooth interpolation
+        currentSmoothScale += (params.targetScale - currentSmoothScale) * settings.scaleSmoothing
+        lastTargetPosition.x += (params.targetPosition.x - lastTargetPosition.x) * settings.positionSmoothing
+        lastTargetPosition.y += (params.targetPosition.y - lastTargetPosition.y) * settings.positionSmoothing
 
-        // Determine target scale and zoom dimensions based on zoom mode
-        let targetScale: CGFloat
-        let targetZoomWidth: CGFloat
-        let targetZoomHeight: CGFloat
-        var targetPosition: CGPoint
-
-        if shouldZoom {
-            switch settings.zoomMode {
-            case .scale:
-                // Scale mode: use zoom scale directly
-                targetScale = max(settings.minZoomScale, min(settings.maxZoomScale, settings.zoomScale))
-                targetZoomWidth = baseWidth / targetScale
-                targetZoomHeight = baseHeight / targetScale
-
-            case .frameSize:
-                // Frame size mode: use specified frame dimensions
-                // Clamp frame size to not exceed base dimensions
-                targetZoomWidth = min(settings.zoomFrameWidth, baseWidth)
-                targetZoomHeight = min(settings.zoomFrameHeight, baseHeight)
-                // Calculate equivalent scale for smoothing
-                targetScale = baseWidth / targetZoomWidth
-            }
-
-            // Apply center offset to the locked position
-            let offsetX = targetZoomWidth * settings.centerOffsetX
-            let offsetY = targetZoomHeight * settings.centerOffsetY
-            targetPosition = CGPoint(
-                x: lockedTargetPosition.x + offsetX,
-                y: lockedTargetPosition.y + offsetY
-            )
-            isTypingDetected = true
-        } else {
-            targetScale = 1.0
-            targetZoomWidth = baseWidth
-            targetZoomHeight = baseHeight
-            targetPosition = defaultCenter
-            isTypingDetected = false
-        }
-
-        // Smooth interpolation with configurable smoothing
-        currentSmoothScale += (targetScale - currentSmoothScale) * settings.scaleSmoothing
-        lastTargetPosition.x += (targetPosition.x - lastTargetPosition.x) * settings.positionSmoothing
-        lastTargetPosition.y += (targetPosition.y - lastTargetPosition.y) * settings.positionSmoothing
-
-        // Calculate active zoom dimensions based on current smooth scale
+        // Calculate active zoom dimensions
+        let baseWidth = baseRegion?.width ?? displaySize.width
+        let baseHeight = baseRegion?.height ?? displaySize.height
         let activeZoomWidth: CGFloat
         let activeZoomHeight: CGFloat
 
@@ -777,64 +845,43 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             activeZoomWidth = baseWidth / currentSmoothScale
             activeZoomHeight = baseHeight / currentSmoothScale
         case .frameSize:
-            // Interpolate frame size for smooth animation
             let targetW = shouldZoom ? min(settings.zoomFrameWidth, baseWidth) : baseWidth
             let targetH = shouldZoom ? min(settings.zoomFrameHeight, baseHeight) : baseHeight
-            let progress = (currentSmoothScale - 1.0) / (targetScale - 1.0 + 0.001) // Avoid division by zero
+            let progress = (currentSmoothScale - 1.0) / (params.targetScale - 1.0 + 0.001)
             let clampedProgress = max(0, min(1, progress))
             activeZoomWidth = baseWidth + (targetW - baseWidth) * clampedProgress
             activeZoomHeight = baseHeight + (targetH - baseHeight) * clampedProgress
         }
 
-        // Calculate source rect origin (top-left corner of the zoom area)
+        // Calculate source rect
         var sourceX = lastTargetPosition.x - activeZoomWidth / 2
         var sourceY = lastTargetPosition.y - activeZoomHeight / 2
-
-        // Clamp to screen bounds
         sourceX = max(0, min(sourceX, displaySize.width - activeZoomWidth))
         sourceY = max(0, min(sourceY, displaySize.height - activeZoomHeight))
 
-        // SCStreamConfiguration.sourceRect uses top-left origin (same as Accessibility)
         let newSourceRect = CGRect(x: sourceX, y: sourceY, width: activeZoomWidth, height: activeZoomHeight)
         currentSourceRect = newSourceRect
 
-        // Handle position updates based on edge margin
-        // Now using the ACTUAL displayed sourceRect (after smoothing and clamping)
-        if let pos = edgeCheckPosition, isZoomActive {
+        // Handle edge margin repositioning
+        if let pos = trigger.position, isZoomActive {
             let timeSinceLastMove = now.timeIntervalSince(lastPositionChangeTime)
-
-            // Use the actual displayed zoom area (sourceRect)
-            let currentZoomLeft = sourceX
-            let currentZoomRight = sourceX + activeZoomWidth
-            let currentZoomTop = sourceY
-            let currentZoomBottom = sourceY + activeZoomHeight
-
-            // Calculate margin in points
             let marginX = activeZoomWidth * settings.edgeMarginRatio
             let marginY = activeZoomHeight * settings.edgeMarginRatio
 
-            // Safe zone boundaries (inside the margin)
-            let safeLeft = currentZoomLeft + marginX
-            let safeRight = currentZoomRight - marginX
-            let safeTop = currentZoomTop + marginY
-            let safeBottom = currentZoomBottom - marginY
+            let safeLeft = sourceX + marginX
+            let safeRight = sourceX + activeZoomWidth - marginX
+            let safeTop = sourceY + marginY
+            let safeBottom = sourceY + activeZoomHeight - marginY
 
-            // Check if cursor is OUTSIDE the safe zone (in edge margin)
-            let nearLeftEdge = pos.x < safeLeft
-            let nearRightEdge = pos.x > safeRight
-            let nearTopEdge = pos.y < safeTop
-            let nearBottomEdge = pos.y > safeBottom
-
-            let isOutsideSafeZone = nearLeftEdge || nearRightEdge || nearTopEdge || nearBottomEdge
+            let isOutsideSafeZone = pos.x < safeLeft || pos.x > safeRight || pos.y < safeTop || pos.y > safeBottom
 
             #if DEBUG
             if now.timeIntervalSince(lastLogTime) > 0.5 {
-                print("[Edge] cursor=(\(Int(pos.x)),\(Int(pos.y))) | safe:(\(Int(safeLeft))-\(Int(safeRight)), \(Int(safeTop))-\(Int(safeBottom))) | outside=\(isOutsideSafeZone)")
+                print("[Edge] cursor=(\(Int(pos.x)),\(Int(pos.y))) | outside=\(isOutsideSafeZone)")
                 lastLogTime = now
             }
             #endif
 
-            // Reposition when cursor is outside safe zone
             if isOutsideSafeZone && timeSinceLastMove > settings.positionHoldDuration {
                 #if DEBUG
                 print("[Edge] REPOSITION triggered!")
@@ -844,114 +891,17 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             }
         }
 
-        // Update Overlay Window and Dimming
-        let targetScreen = getTargetScreen()
-        let screenHeight = targetScreen.frame.height
-        let screenOrigin = targetScreen.frame.origin
+        // Update UI
+        updateOverlayAndDimming(sourceRect: newSourceRect, isZoomActive: isZoomActive, settings: settings)
 
-        // Convert from top-left to bottom-left origin for window positioning (global coords)
-        // Note: For main screen, origin.y is 0. For other screens, it varies.
-        let windowY = screenOrigin.y + screenHeight - sourceY - activeZoomHeight
-
-        // Update overlay window (uses global coordinates)
-        if let window = self.overlayWindow {
-            window.setFrame(NSRect(x: sourceX, y: windowY, width: activeZoomWidth, height: activeZoomHeight), display: true)
-            window.alphaValue = (settings.showOverlay && isZoomActive) ? 1.0 : 0.0
-        }
-
-        // Update overlay view model with current settings
-        if let viewModel = self.overlayViewModel {
-            viewModel.edgeMargin = settings.edgeMarginRatio
-            viewModel.showSafeZone = settings.showSafeZone
-        }
-
-        // Update dimming hole rect to follow the zoom area
-        if let viewModel = self.dimmingViewModel {
-            if settings.showDimming && isZoomActive {
-                // Show hole for the current zoom area (follows the zoom dynamically)
-                // sourceX, sourceY are in display-local top-left coordinates
-                viewModel.holeRect = CGRect(x: sourceX, y: sourceY, width: activeZoomWidth, height: activeZoomHeight)
-            } else if settings.showDimming {
-                // Not zooming - show hole for entire recording region
-                if let region = baseRegion {
-                    let localX = region.origin.x - screenOrigin.x
-                    let localY = screenHeight - (region.origin.y - screenOrigin.y) - region.height
-                    viewModel.holeRect = CGRect(x: localX, y: localY, width: region.width, height: region.height)
-                } else {
-                    viewModel.holeRect = CGRect(origin: .zero, size: targetScreen.frame.size)
-                }
-            } else {
-                // Dimming disabled - hole covers entire screen
-                viewModel.holeRect = CGRect(origin: .zero, size: targetScreen.frame.size)
-            }
-        }
-
-        // Stream Update (throttled to avoid too many config updates)
-        if now.timeIntervalSince(lastUpdateTimestamp) > 0.033 { // ~30fps for config updates
-            if let stream = stream {
-                let config = SCStreamConfiguration()
-                config.sourceRect = currentSourceRect
-                config.width = Int(displaySize.width) * 2
-                config.height = Int(displaySize.height) * 2
-                config.showsCursor = settings.showCursor
-                stream.updateConfiguration(config) { error in
-                    if let error = error {
-                        print("Failed to update stream configuration: \(error.localizedDescription)")
-                    }
-                }
-            }
+        // Update stream (throttled)
+        if now.timeIntervalSince(lastUpdateTimestamp) > 0.033 {
+            updateStreamConfig(sourceRect: currentSourceRect, showCursor: settings.showCursor)
             lastUpdateTimestamp = now
         }
 
-        // Update subtitles if enabled
-        if settings.subtitlesEnabled, let viewModel = subtitleViewModel {
-            // Get typed text from key buffer (works in all apps)
-            if let typedText = InputMonitor.shared.getTypedBuffer() {
-                // Update text if changed
-                if typedText != lastSubtitleText {
-                    lastSubtitleText = typedText
-                    viewModel.text = typedText
-                }
-                // Keep visible and update time while typing
-                lastSubtitleUpdateTime = now
-                viewModel.isVisible = true
-            }
-
-            // Hide subtitle after display duration of no typing
-            let timeSinceLastUpdate = now.timeIntervalSince(lastSubtitleUpdateTime)
-            if timeSinceLastUpdate > settings.subtitleDisplayDuration && viewModel.isVisible {
-                viewModel.isVisible = false
-                lastSubtitleText = ""
-                InputMonitor.shared.clearTypedBuffer()
-            }
-
-            // Update view model settings
-            viewModel.fontSize = settings.subtitleFontSize
-            viewModel.backgroundOpacity = settings.subtitleBackgroundOpacity
-
-            // Update subtitle window position to follow zoom area
-            if let window = subtitleWindow {
-                let subtitleHeight: CGFloat = 80
-                let margin: CGFloat = 10
-
-                // Use current zoom area for positioning
-                let subtitleY: CGFloat
-                if settings.subtitlePosition == 0 {
-                    // Bottom of zoom area
-                    subtitleY = screenOrigin.y + screenHeight - sourceY - activeZoomHeight + margin
-                } else {
-                    // Top of zoom area
-                    subtitleY = screenOrigin.y + screenHeight - sourceY - subtitleHeight - margin
-                }
-
-                window.setFrame(CGRect(
-                    x: screenOrigin.x + sourceX,
-                    y: subtitleY,
-                    width: activeZoomWidth,
-                    height: subtitleHeight
-                ), display: false)
-            }
-        }
+        // Update subtitles
+        updateSubtitleDisplay(settings: settings, sourceRect: newSourceRect, now: now)
     }
 
     // MARK: - Output

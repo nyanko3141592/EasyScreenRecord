@@ -131,17 +131,6 @@ class RecorderViewModel: ObservableObject {
         }
     }
 
-    // Legacy method for compatibility
-    func confirmSelection() {
-        guard let window = selectionWindow else { return }
-        let frame = window.frame
-        recorder.setBaseRegion(frame)
-        cancelSelection()
-        Task {
-            await recorder.startCapture()
-        }
-    }
-
     func toggleRecording() {
         if isRecording {
             Task {

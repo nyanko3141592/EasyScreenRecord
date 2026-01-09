@@ -452,8 +452,8 @@ struct AccessibilityUtils {
         return nil
     }
 
-    /// Get element position only if it's a small element (likely a text field, not a whole window)
-    private static func getSmallElementPosition(for element: AXUIElement) -> CGPoint? {
+    /// Get element frame (position and size) from AXUIElement
+    private static func getElementFrame(for element: AXUIElement) -> (position: CGPoint, size: CGSize)? {
         var pointValue: CFTypeRef?
         var sizeValue: CFTypeRef?
 
@@ -470,59 +470,40 @@ struct AccessibilityUtils {
         AXValueGetValue(pointRef as! AXValue, .cgPoint, &pos)
         AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
 
+        guard size.width > 0 && size.height > 0 else { return nil }
+        return (pos, size)
+    }
+
+    /// Get element center position
+    private static func getElementCenter(for element: AXUIElement) -> CGPoint? {
+        guard let frame = getElementFrame(for: element) else { return nil }
+        return CGPoint(x: frame.position.x + frame.size.width / 2, y: frame.position.y + frame.size.height / 2)
+    }
+
+    /// Get element position only if it's a small element (likely a text field, not a whole window)
+    private static func getSmallElementPosition(for element: AXUIElement) -> CGPoint? {
+        guard let frame = getElementFrame(for: element) else { return nil }
+
         // Only use element position if it's reasonably small (like a text field)
-        // Large elements (like terminal views, web areas) would give wrong center position
         let maxReasonableSize: CGFloat = 400
-        if size.width > 0 && size.height > 0 &&
-           size.width < maxReasonableSize && size.height < maxReasonableSize {
-            return CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
+        guard frame.size.width < maxReasonableSize && frame.size.height < maxReasonableSize else {
+            return nil
         }
 
-        return nil
+        return CGPoint(x: frame.position.x + frame.size.width / 2, y: frame.position.y + frame.size.height / 2)
     }
 
     /// Get mouse cursor position in screen coordinates (top-left origin)
     private static func getMousePositionInScreenCoords() -> CGPoint? {
-        // NSEvent.mouseLocation is in bottom-left origin (Cocoa coordinates)
         let mouseLocation = NSEvent.mouseLocation
 
-        // Find the screen containing the mouse
         for screen in NSScreen.screens {
             if screen.frame.contains(mouseLocation) {
-                // Get the primary screen's height for coordinate conversion
-                // Accessibility API uses top-left origin where Y=0 is at top of primary screen
                 guard let primaryScreen = NSScreen.screens.first else { return nil }
                 let primaryHeight = primaryScreen.frame.height
-
-                // Convert: in Cocoa, Y increases upward; in Accessibility, Y increases downward
                 let screenY = primaryHeight - mouseLocation.y
                 return CGPoint(x: mouseLocation.x, y: screenY)
             }
-        }
-
-        return nil
-    }
-
-    /// Get element position (center point)
-    private static func getElementPosition(for element: AXUIElement) -> CGPoint? {
-        var pointValue: CFTypeRef?
-        var sizeValue: CFTypeRef?
-
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &pointValue) == .success,
-              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success,
-              let pointRef = pointValue, CFGetTypeID(pointRef) == AXValueGetTypeID(),
-              let sizeRef = sizeValue, CFGetTypeID(sizeRef) == AXValueGetTypeID() else {
-            return nil
-        }
-
-        var pos = CGPoint.zero
-        var size = CGSize.zero
-
-        AXValueGetValue(pointRef as! AXValue, .cgPoint, &pos)
-        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
-
-        if size.width > 0 && size.height > 0 {
-            return CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
         }
 
         return nil
@@ -679,28 +660,4 @@ struct AccessibilityUtils {
         return nil
     }
 
-    private static func getElementCenterPosition(for element: AXUIElement) -> CGPoint? {
-        var pointValue: CFTypeRef?
-        let pointResult = AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &pointValue)
-
-        var sizeValue: CFTypeRef?
-        let sizeResult = AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue)
-
-        if pointResult == .success, let pointRef = pointValue, CFGetTypeID(pointRef) == AXValueGetTypeID(),
-           sizeResult == .success, let sizeRef = sizeValue, CFGetTypeID(sizeRef) == AXValueGetTypeID() {
-
-            var pos = CGPoint.zero
-            var size = CGSize.zero
-
-            AXValueGetValue(pointRef as! AXValue, .cgPoint, &pos)
-            AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
-
-            // Only consider it valid if it's a reasonable text field size
-            if size.height < 200 && size.height > 10 {
-                return CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
-            }
-        }
-
-        return nil
-    }
 }
