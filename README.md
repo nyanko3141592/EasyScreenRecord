@@ -100,6 +100,19 @@ cd EasyScreenRecord/EasyScreenRecord
 - **出力形式**: MOV (H.264)
 - **解像度**: Retina対応（2倍スケール）
 
+## クイックスタート（開発者向け）
+
+```bash
+# リポジトリをクローン
+git clone https://github.com/nyanko3141592/EasyScreenRecord.git
+cd EasyScreenRecord/EasyScreenRecord
+
+# ビルドして起動
+./run.sh
+```
+
+詳細は [開発ガイド](./DEVELOPER_GUIDE.md) を参照してください。
+
 ## 開発
 
 ```bash
@@ -112,6 +125,18 @@ cd EasyScreenRecord/EasyScreenRecord
 # リリース用DMG作成
 ./build-dmg.sh
 ```
+
+## ドキュメント
+
+| ドキュメント | 説明 |
+|-------------|------|
+| [アーキテクチャ](./ARCHITECTURE.md) | システム設計・コンポーネント構成 |
+| [開発ガイド](./DEVELOPER_GUIDE.md) | 開発環境セットアップ・ビルド方法 |
+| [コントリビューション](./CONTRIBUTING.md) | 貢献の方法・コードスタイル |
+
+## 貢献
+
+バグ報告、機能リクエスト、Pull Request を歓迎します。詳細は [CONTRIBUTING.md](./CONTRIBUTING.md) をご覧ください。
 
 ## ライセンス
 
