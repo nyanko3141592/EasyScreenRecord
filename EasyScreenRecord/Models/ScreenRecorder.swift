@@ -810,18 +810,19 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             viewModel.showSafeZone = settings.showSafeZone
         }
 
-        // Update dimming hole rect (needs window-local coordinates)
+        // Update dimming hole rect to follow the zoom area
         if let viewModel = self.dimmingViewModel {
-            if settings.showDimming {
+            if settings.showDimming && isZoomActive {
+                // Show hole for the current zoom area (follows the zoom dynamically)
+                // sourceX, sourceY are in display-local top-left coordinates
+                viewModel.holeRect = CGRect(x: sourceX, y: sourceY, width: activeZoomWidth, height: activeZoomHeight)
+            } else if settings.showDimming {
+                // Not zooming - show hole for entire recording region
                 if let region = baseRegion {
-                    // Show hole for the entire recording region (baseRegion)
-                    // baseRegion is in NSWindow global coords (bottom-left origin)
-                    // Convert to SwiftUI window-local coords (top-left origin)
                     let localX = region.origin.x - screenOrigin.x
                     let localY = screenHeight - (region.origin.y - screenOrigin.y) - region.height
                     viewModel.holeRect = CGRect(x: localX, y: localY, width: region.width, height: region.height)
                 } else {
-                    // Full screen recording - no dimming needed
                     viewModel.holeRect = CGRect(origin: .zero, size: targetScreen.frame.size)
                 }
             } else {
