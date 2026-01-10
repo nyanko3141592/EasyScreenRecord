@@ -2,3 +2,10 @@
 concept.md
 CURRENT_STATUS.md
 image.png
+
+# Build artifacts
+build/
+*.dmg
+
+# Xcode user data
+xcuserdata/

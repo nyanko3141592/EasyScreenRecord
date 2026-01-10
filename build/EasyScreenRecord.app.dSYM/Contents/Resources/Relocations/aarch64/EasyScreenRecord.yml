@@ -1,5 +1,0 @@
----
-triple:          'arm64-apple-darwin'
-binary-path:     '/Users/takahashinaoki/Dev/Hobby/EasyScreenRecord/EasyScreenRecord/build/EasyScreenRecord.app/Contents/MacOS/EasyScreenRecord'
-relocations:     []
-...
