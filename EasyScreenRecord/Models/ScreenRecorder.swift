@@ -5,7 +5,7 @@ import Combine
 import AppKit
 import SwiftUI
 
-class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
+class ScreenRecorder: NSObject, ObservableObject {
     enum RecordingState {
         case idle
         case starting
@@ -31,9 +31,10 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     }
     
     private var stream: SCStream?
-    private var assetWriter: AVAssetWriter?
-    private var videoInput: AVAssetWriterInput?
-    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    /// Applies mosaic + zoom crop to captured frames and writes the video
+    private var compositor: FrameCompositor?
+    /// Last finished recording
+    @Published var lastRecordingURL: URL?
     
     // Zoom & Region settings
     private(set) var zoomScale: CGFloat = 2.0
@@ -60,14 +61,10 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
     private var dimmingViewModel: DimmingViewModel?
     private var subtitleWindow: NSWindow?
     private var subtitleViewModel: SubtitleViewModel?
+    private var mosaicOutlineWindow: NSWindow?
     private var lastUpdateTimestamp: Date = .distantPast
     private var lastSubtitleText: String = ""
     private var lastSubtitleUpdateTime: Date = .distantPast
-
-    // Serial queue for writing to ensure safety
-    private let writingQueue = DispatchQueue(label: "com.nya3neko2.EasyScreenRecord.writingQueue", qos: .userInitiated)
-    private var isWritingSessionStarted = false
-    private var isStopping = false // Flag to prevent new writes during stop
 
     func setZoomScale(_ scale: CGFloat) {
         self.zoomScale = scale
@@ -89,10 +86,12 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             // Setup overlay windows FIRST and show them (before getting content, so we can exclude them)
             setupOverlayWindow()
             setupDimmingWindow()
+            setupMosaicOutlineWindow()
 
             // Show windows immediately so they appear in SCShareableContent
             overlayWindow?.orderFrontRegardless()
             dimmingWindow?.orderFrontRegardless()
+            mosaicOutlineWindow?.orderFrontRegardless()
 
             // Delay to ensure windows are registered in the window server
             try await Task.sleep(nanoseconds: 200_000_000) // 0.2 second
@@ -100,15 +99,18 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             self.availableContent = content
 
-            guard let display = content.displays.first else {
+            // Capture the display that matches the screen the region was selected on
+            let targetScreen = getTargetScreen()
+            let targetDisplayID = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+            guard let display = content.displays.first(where: { $0.displayID == targetDisplayID }) ?? content.displays.first else {
                 throw NSError(domain: "ScreenRecorder", code: -1, userInfo: [NSLocalizedDescriptionKey: "No display found"])
             }
 
             displaySize = CGSize(width: CGFloat(display.width), height: CGFloat(display.height))
+            let pointScale = max(1, targetScreen.backingScaleFactor)
 
             // Get display origin for coordinate conversion (Accessibility uses global coordinates)
             // SCDisplay doesn't expose frame directly, so get it from NSScreen
-            let targetScreen = getTargetScreen()
             // NSScreen uses bottom-left origin; convert to top-left for Accessibility coordinates
             let primaryHeight = NSScreen.screens.first?.frame.height ?? displaySize.height
             displayOrigin = CGPoint(
@@ -116,11 +118,16 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
                 y: primaryHeight - targetScreen.frame.origin.y - targetScreen.frame.height
             )
 
+            // Always capture the full display at native resolution.
+            // Mosaic and zoom crop are applied afterwards by FrameCompositor, so the
+            // mosaic stays pinned to the screen area regardless of zoom.
             let config = SCStreamConfiguration()
-            config.width = Int(displaySize.width) * 2
-            config.height = Int(displaySize.height) * 2
+            config.width = Int(displaySize.width * pointScale)
+            config.height = Int(displaySize.height * pointScale)
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(zoomSettings.frameRate))
-            config.queueDepth = 8
+            config.queueDepth = 6
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.colorSpaceName = CGColorSpace.sRGB
             config.showsCursor = zoomSettings.showCursor
 
             // Exclude ALL windows from our own app (overlay, dimming, settings, etc.)
@@ -146,17 +153,13 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
 
             let filter = SCContentFilter(display: display, excludingWindows: windowsToExclude)
 
-            // Reset Session State
-            isWritingSessionStarted = false
-            isStopping = false
-
             // Reset Zoom State
             currentSmoothScale = 1.0
             isTypingDetected = false
             isZoomActive = false
             lastTypingDetectedTime = .distantPast
             lastPositionChangeTime = .distantPast
-            currentSourceRect = CGRect(origin: .zero, size: displaySize)
+            currentSourceRect = baseLocalRect()
 
             // Initialize lastTargetPosition based on baseRegion or screen center (in local coordinates)
             let initialPosition: CGPoint
@@ -172,15 +175,24 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             lastTargetPosition = initialPosition
             lockedTargetPosition = initialPosition
 
-            // Setup Asset Writer
-            try setupAssetWriter(width: config.width, height: config.height)
+            // Setup compositor (writer). Output size = recording region at native resolution.
+            let newCompositor = try FrameCompositor(
+                outputURL: makeOutputURL(),
+                displaySize: displaySize,
+                outputSize: outputPixelSize(for: currentSourceRect.size, pointScale: pointScale),
+                frameRate: zoomSettings.frameRate,
+                quality: zoomSettings.videoQuality,
+                initialState: compositorState(sourceRect: currentSourceRect)
+            )
+            self.compositor = newCompositor
 
             // Setup Stream
             let newStream = SCStream(filter: filter, configuration: config, delegate: self)
-            try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: writingQueue)
+            try newStream.addStreamOutput(newCompositor, type: .screen, sampleHandlerQueue: newCompositor.sampleQueue)
             self.stream = newStream
 
             try await newStream.startCapture()
+            newCompositor.start()
 
             // Start keyboard monitoring for typing detection
             KeyboardMonitor.shared.showModifierKeys = zoomSettings.showModifierKeys
@@ -206,6 +218,7 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             // Windows already shown at start, just ensure they're on top
             self.overlayWindow?.orderFrontRegardless()
             self.dimmingWindow?.orderFrontRegardless()
+            self.mosaicOutlineWindow?.orderFrontRegardless()
 
             // Setup subtitle window AFTER stream starts (so it IS captured in recording)
             if zoomSettings.subtitlesEnabled {
@@ -226,6 +239,10 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
             state = .error(error)
             cleanupWindows()
             stopZoomTimer()
+            try? await stream?.stopCapture()
+            stream = nil
+            _ = await compositor?.finish()
+            compositor = nil
             
             // Allow user to see error briefly or just reset
             try? await Task.sleep(nanoseconds: 1 * 1_000_000_000)
@@ -245,132 +262,67 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
 
         let activeStream = self.stream
         self.stream = nil // Detach stream reference
-
-        // Capture references before queue operation
-        let writer = self.assetWriter
-        let input = self.videoInput
-        let outputURL = writer?.outputURL
+        let activeCompositor = self.compositor
+        self.compositor = nil
 
         do {
-            if let s = activeStream {
-                try await s.stopCapture()
-            }
-
-            // Close writer on queue
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                writingQueue.async { [weak self] in
-                    defer {
-                        continuation.resume()
-                    }
-
-                    // Set stopping flag first
-                    self?.isStopping = true
-
-                    guard let writer = writer else { return }
-
-                    if writer.status == .writing {
-                        input?.markAsFinished()
-                        let semaphore = DispatchSemaphore(value: 0)
-                        writer.finishWriting {
-                            semaphore.signal()
-                        }
-                        _ = semaphore.wait(timeout: .now() + 5.0)
-                    } else if writer.status != .completed {
-                        // If we never started writing or errored, cancel
-                        writer.cancelWriting()
-                    }
-                }
-            }
-
-            // Cleanup references on main thread
-            self.assetWriter = nil
-            self.videoInput = nil
-            self.pixelBufferAdaptor = nil
-            self.isWritingSessionStarted = false
-            self.isStopping = false
-
-            withAnimation {
-                state = .idle
-            }
-
-            if let url = outputURL {
-                print("Recording finished: \(url.path)")
-            }
-
+            try await activeStream?.stopCapture()
         } catch {
             print("Failed to stop capture: \(error)")
-            // Cleanup on error too
-            self.assetWriter = nil
-            self.videoInput = nil
-            self.pixelBufferAdaptor = nil
-            self.isWritingSessionStarted = false
-            self.isStopping = false
-            state = .error(error)
+        }
+
+        // Finalize the file even if stopping the stream failed
+        if let url = await activeCompositor?.finish() {
+            lastRecordingURL = url
+            print("Recording finished: \(url.path)")
+        }
+
+        withAnimation {
+            state = .idle
         }
     }
-    
+
     // MARK: - Internal
     
-    private func setupAssetWriter(width: Int, height: Int) throws {
-        let evenWidth = (width >> 1) << 1
-        let evenHeight = (height >> 1) << 1
-
+    private func makeOutputURL() -> URL {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let timestamp = dateFormatter.string(from: Date())
-        let fileName = "Recording_\(timestamp).mov"
-        let fileURL = zoomSettings.effectiveOutputDirectory.appendingPathComponent(fileName)
-
-        let writer = try AVAssetWriter(outputURL: fileURL, fileType: .mov)
-
-        // Calculate bitrate based on quality (0.5 = 2x, 0.8 = 4x, 1.0 = 6x of base)
-        let baseBitrate = evenWidth * evenHeight
-        let qualityMultiplier = 2.0 + (zoomSettings.videoQuality * 4.0) // 2x to 6x
-        let bitrate = Int(Double(baseBitrate) * qualityMultiplier)
-        let frameRate = zoomSettings.frameRate
-
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: evenWidth,
-            AVVideoHeightKey: evenHeight,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoExpectedSourceFrameRateKey: frameRate,
-                AVVideoMaxKeyFrameIntervalKey: frameRate
-            ]
-        ]
-
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        input.expectsMediaDataInRealTime = true
-
-        // Create pixel buffer adaptor for handling CVPixelBuffer from ScreenCaptureKit
-        let sourcePixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: evenWidth,
-            kCVPixelBufferHeightKey as String: evenHeight
-        ]
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: sourcePixelBufferAttributes
-        )
-
-        if writer.canAdd(input) {
-            writer.add(input)
-        } else {
-            throw NSError(domain: "app", code: -1, userInfo: [NSLocalizedDescriptionKey: "Cant add input"])
-        }
-
-        // Start writing immediately to transition state to 'writing'
-        // Session will be started when first frame arrives
-        if !writer.startWriting() {
-            throw writer.error ?? NSError(domain: "app", code: -1, userInfo: [NSLocalizedDescriptionKey: "Start writing failed"])
-        }
-
-        self.assetWriter = writer
-        self.videoInput = input
-        self.pixelBufferAdaptor = adaptor
+        return zoomSettings.effectiveOutputDirectory.appendingPathComponent("Recording_\(timestamp).mov")
     }
-    
+
+    /// Video size in pixels for a region (points). Capped to what H.264 can encode.
+    private func outputPixelSize(for size: CGSize, pointScale: CGFloat) -> CGSize {
+        var width = size.width * pointScale
+        var height = size.height * pointScale
+        let maxWidth: CGFloat = 4096, maxHeight: CGFloat = 2304
+        let fit = min(1, maxWidth / width, maxHeight / height)
+        width *= fit
+        height *= fit
+        return CGSize(width: max(2, width.rounded()), height: max(2, height.rounded()))
+    }
+
+    /// Recording region in display-local top-left points (full display if none selected)
+    private func baseLocalRect() -> CGRect {
+        guard let region = baseRegion else { return CGRect(origin: .zero, size: displaySize) }
+        return CGRect(
+            x: region.origin.x - displayOrigin.x,
+            y: displaySize.height - (region.origin.y - displayOrigin.y) - region.height,
+            width: region.width,
+            height: region.height
+        )
+    }
+
+    private func compositorState(sourceRect: CGRect) -> CompositorState {
+        let settings = zoomSettings
+        return CompositorState(
+            sourceRect: sourceRect,
+            mosaicRects: settings.mosaicEnabled ? settings.mosaicRegions.map(\.rect) : [],
+            mosaicBlockSize: settings.mosaicBlockSize,
+            mosaicStyle: settings.mosaicStyle
+        )
+    }
+
     /// Create a transparent overlay window with standard configuration
     private func createOverlayWindow(frame: NSRect) -> NSWindow {
         let window = NSWindow(
@@ -476,7 +428,18 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
                                height: subtitleHeight), display: true)
     }
 
+    /// Shows where mosaic will be applied (this window is excluded from the recording)
+    private func setupMosaicOutlineWindow() {
+        guard zoomSettings.isMosaicActive else { return }
+        let screen = getTargetScreen()
+        let window = createOverlayWindow(frame: screen.frame)
+        window.contentView = NSHostingView(rootView: MosaicOutlineView(settings: zoomSettings))
+        self.mosaicOutlineWindow = window
+    }
+
     private func cleanupWindows() {
+        mosaicOutlineWindow?.close()
+        mosaicOutlineWindow = nil
         overlayWindow?.close()
         overlayWindow = nil
         overlayViewModel = nil
@@ -691,21 +654,9 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
         }
     }
 
-    /// Update stream configuration
-    private func updateStreamConfig(sourceRect: CGRect, showCursor: Bool) {
-        guard let stream = stream else { return }
-
-        let config = SCStreamConfiguration()
-        config.sourceRect = sourceRect
-        config.width = Int(displaySize.width) * 2
-        config.height = Int(displaySize.height) * 2
-        config.showsCursor = showCursor
-
-        stream.updateConfiguration(config) { error in
-            if let error = error {
-                print("Failed to update stream configuration: \(error.localizedDescription)")
-            }
-        }
+    /// Push the current zoom rect + mosaic settings to the compositor
+    private func updateCompositor(sourceRect: CGRect) {
+        compositor?.update(compositorState(sourceRect: sourceRect))
     }
 
     /// Update subtitle display
@@ -782,13 +733,11 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
 
         // Handle smart zoom disabled case
         if !settings.smartZoomEnabled {
-            if now.timeIntervalSince(lastUpdateTimestamp) > 0.033 {
-                updateStreamConfig(sourceRect: CGRect(origin: .zero, size: displaySize), showCursor: settings.showCursor)
-                lastUpdateTimestamp = now
-            }
+            currentSourceRect = baseLocalRect()
+            updateCompositor(sourceRect: currentSourceRect)
             overlayWindow?.alphaValue = 0.0
             updateOverlayAndDimming(
-                sourceRect: CGRect(origin: .zero, size: displaySize),
+                sourceRect: currentSourceRect,
                 isZoomActive: false,
                 settings: settings
             )
@@ -894,69 +843,13 @@ class ScreenRecorder: NSObject, ObservableObject, SCStreamOutput {
         // Update UI
         updateOverlayAndDimming(sourceRect: newSourceRect, isZoomActive: isZoomActive, settings: settings)
 
-        // Update stream (throttled)
-        if now.timeIntervalSince(lastUpdateTimestamp) > 0.033 {
-            updateStreamConfig(sourceRect: currentSourceRect, showCursor: settings.showCursor)
-            lastUpdateTimestamp = now
-        }
+        // Update compositor (cheap: just swaps a struct under a lock)
+        updateCompositor(sourceRect: currentSourceRect)
 
         // Update subtitles
         updateSubtitleDisplay(settings: settings, sourceRect: newSourceRect, now: now)
     }
 
-    // MARK: - Output
-    
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
-
-        // Pass to writing queue
-        writingQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            // 1. Check stopping flag first
-            if self.isStopping { return }
-
-            // 2. Check writer state
-            guard let writer = self.assetWriter,
-                  let input = self.videoInput,
-                  let adaptor = self.pixelBufferAdaptor else { return }
-
-            if writer.status == .failed {
-                if let error = writer.error as NSError? {
-                    print("Writer failed: \(error.localizedDescription), code: \(error.code), domain: \(error.domain)")
-                } else {
-                    print("Writer failed: unknown error")
-                }
-                return
-            }
-
-            if writer.status == .completed || writer.status == .cancelled {
-                return
-            }
-
-            // 3. Validate Buffer and get pixel buffer
-            guard CMSampleBufferDataIsReady(sampleBuffer), CMSampleBufferIsValid(sampleBuffer) else { return }
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-            // 4. Start Session if needed (startWriting already called in setupAssetWriter)
-            if !self.isWritingSessionStarted && writer.status == .writing {
-                writer.startSession(atSourceTime: presentationTime)
-                self.isWritingSessionStarted = true
-                print("AVAssetWriter session started at \(presentationTime.seconds)")
-            }
-
-            // 5. Append using pixel buffer adaptor
-            if self.isWritingSessionStarted && input.isReadyForMoreMediaData {
-                if !adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
-                    if let error = writer.error as NSError? {
-                        print("Failed to append buffer: \(error.localizedDescription), code: \(error.code)")
-                    }
-                }
-            }
-        }
-    }
 }
 
 extension ScreenRecorder: SCStreamDelegate {

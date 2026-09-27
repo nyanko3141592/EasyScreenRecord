@@ -17,6 +17,8 @@ class RecorderViewModel: ObservableObject {
 
     private var selectionWindow: NSWindow?
     private var selectionController: RegionSelectorController?
+    private var mosaicEditorWindow: NSWindow?
+    private var keyMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
 
     init() {
@@ -35,6 +37,13 @@ class RecorderViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // Forward nested changes (recorder / settings) so menu bar items stay current
+        recorder.objectWillChange
+            .merge(with: recorder.zoomSettings.objectWillChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
         // Sync ZoomSettings.zoomScale back to viewModel
         recorder.zoomSettings.$zoomScale
             .receive(on: DispatchQueue.main)
@@ -50,23 +59,11 @@ class RecorderViewModel: ObservableObject {
         if isRecording { return }
         isSelectingRegion = true
 
+        closeMosaicEditor()
         guard let screen = NSScreen.main else { return }
 
         // Create full-screen window for selection
-        let window = NSWindow(
-            contentRect: screen.frame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.hasShadow = false
-        window.level = .screenSaver  // Above everything
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.isReleasedWhenClosed = false
-        window.acceptsMouseMovedEvents = true
-        window.ignoresMouseEvents = false  // Important: accept mouse events
+        let window = makeFullScreenWindow(for: screen)
 
         // Create controller for selection logic
         let controller = RegionSelectorController()
@@ -78,6 +75,10 @@ class RecorderViewModel: ObservableObject {
             self?.cancelSelection()
         }
         self.selectionController = controller
+        installKeyMonitor(
+            onEscape: { [weak controller] in controller?.handleEscape() },
+            onReturn: { [weak controller] in controller?.handleReturn() }
+        )
 
         let hostingView = NSHostingView(rootView: RegionSelectorOverlay(controller: controller))
         hostingView.frame = NSRect(origin: .zero, size: screen.frame.size)
@@ -95,6 +96,7 @@ class RecorderViewModel: ObservableObject {
     }
 
     func cancelSelection() {
+        removeKeyMonitor()
         isSelectingRegion = false
         selectionWindow?.close()
         selectionWindow = nil
@@ -120,6 +122,7 @@ class RecorderViewModel: ObservableObject {
         recorder.setBaseRegion(convertedRect)
 
         // Close selection window
+        removeKeyMonitor()
         isSelectingRegion = false
         selectionWindow?.close()
         selectionWindow = nil
@@ -128,6 +131,77 @@ class RecorderViewModel: ObservableObject {
         // Start recording automatically
         Task {
             await recorder.startCapture()
+        }
+    }
+
+    // MARK: - Mosaic Editor (standalone, from the menu bar)
+
+    func editMosaicRegions() {
+        if isRecording || isSelectingRegion { return }
+        closeMosaicEditor()
+        guard let screen = NSScreen.main else { return }
+
+        let window = makeFullScreenWindow(for: screen)
+        let settings = recorder.zoomSettings
+        let editor = MosaicEditorLayer(settings: settings, dimBackground: true) { [weak self] in
+            self?.closeMosaicEditor()
+        }
+        let hostingView = NSHostingView(rootView: editor)
+        hostingView.frame = NSRect(origin: .zero, size: screen.frame.size)
+        window.contentView = hostingView
+
+        installKeyMonitor(
+            onEscape: { [weak self] in self?.closeMosaicEditor() },
+            onReturn: { [weak self] in self?.closeMosaicEditor() }
+        )
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        mosaicEditorWindow = window
+    }
+
+    func closeMosaicEditor() {
+        guard let window = mosaicEditorWindow else { return }
+        removeKeyMonitor()
+        window.close()
+        mosaicEditorWindow = nil
+    }
+
+    // MARK: - Window helpers
+
+    private func makeFullScreenWindow(for screen: NSScreen) -> NSWindow {
+        let window = KeyableWindow(
+            contentRect: screen.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false
+        window.level = .screenSaver  // Above everything
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = true
+        window.ignoresMouseEvents = false  // Important: accept mouse events
+        return window
+    }
+
+    /// ESC / Return handling that works regardless of which view has focus
+    private func installKeyMonitor(onEscape: @escaping () -> Void, onReturn: @escaping () -> Void) {
+        removeKeyMonitor()
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            switch event.keyCode {
+            case 53: onEscape(); return nil        // Escape
+            case 36, 76: onReturn(); return nil    // Return / Enter
+            default: return event
+            }
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
         }
     }
 

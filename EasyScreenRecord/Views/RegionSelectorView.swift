@@ -9,6 +9,8 @@ class RegionSelectorController {
     var isDragging = false
     var isAdjusting = false  // After initial drag, allow adjustments
     var activeHandle: ResizeHandle? = nil
+    /// Mosaic region editing mode (drawn on top of the selection)
+    var isEditingMosaic = false
 
     // Settings reference for toggles
     var zoomSettings: ZoomSettings?
@@ -157,6 +159,23 @@ class RegionSelectorController {
     func cancel() {
         onCancel?()
     }
+
+    /// Keyboard routing (called from the selection window's key monitor)
+    func handleEscape() {
+        if isEditingMosaic {
+            isEditingMosaic = false
+        } else {
+            cancel()
+        }
+    }
+
+    func handleReturn() {
+        if isEditingMosaic {
+            isEditingMosaic = false
+        } else if isAdjusting {
+            confirm()
+        }
+    }
 }
 
 // MARK: - Full Screen Overlay View
@@ -173,8 +192,13 @@ struct RegionSelectorOverlay: View {
                 SelectionMaskView(rect: selectionRect, screenSize: geo.size)
                     .allowsHitTesting(false)
 
+                // Registered mosaic regions (read-only preview)
+                if let settings = controller.zoomSettings, !controller.isEditingMosaic {
+                    MosaicRegionsPreview(settings: settings)
+                }
+
                 // Selection rectangle during dragging
-                if selectionRect.width > 0 && selectionRect.height > 0 {
+                if selectionRect.width > 0 && selectionRect.height > 0 && !controller.isEditingMosaic {
                     if isAdjusting, let settings = controller.zoomSettings {
                         // Full SelectionRectView with buttons (clickable)
                         SelectionRectView(
@@ -205,6 +229,7 @@ struct RegionSelectorOverlay: View {
                 }
 
                 // Instructions
+                if !controller.isEditingMosaic {
                 VStack {
                     if !isAdjusting && !isDragging {
                         InstructionBadge(text: "ドラッグで範囲を選択 (ESCでキャンセル)", icon: "rectangle.dashed")
@@ -217,6 +242,7 @@ struct RegionSelectorOverlay: View {
                 }
                 .padding(.top, 60)
                 .allowsHitTesting(false)
+                }
 
                 // Cancel button (always visible)
                 Button(action: { controller.cancel() }) {
@@ -257,17 +283,22 @@ struct RegionSelectorOverlay: View {
                     )
                     .frame(width: geo.size.width, height: geo.size.height)
                 }
+
+                // Mosaic editor (on top of everything)
+                if controller.isEditingMosaic, let settings = controller.zoomSettings {
+                    MosaicEditorLayer(settings: settings, dimBackground: false) {
+                        controller.isEditingMosaic = false
+                    }
+                }
             }
         }
         .ignoresSafeArea()
         .onKeyPress(.escape) {
-            controller.cancel()
+            controller.handleEscape()
             return .handled
         }
         .onKeyPress(.return) {
-            if isAdjusting {
-                controller.confirm()
-            }
+            controller.handleReturn()
             return .handled
         }
         .focusable()
@@ -482,6 +513,49 @@ struct SelectionRectView: View {
                                         action: { settings.zoomOnTextSelection.toggle() }
                                     )
                                 }
+                            }
+                        }
+
+                        Divider()
+                            .background(Color.white.opacity(0.2))
+
+                        // Mosaic section
+                        VStack(spacing: 8) {
+                            HStack {
+                                Image(systemName: "square.grid.3x3.fill")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text("モザイク")
+                                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                                Spacer()
+                                Toggle("", isOn: Binding(
+                                    get: { settings.mosaicEnabled },
+                                    set: { settings.mosaicEnabled = $0 }
+                                ))
+                                .toggleStyle(.switch)
+                                .scaleEffect(0.7)
+                                .labelsHidden()
+                            }
+
+                            HStack(spacing: 8) {
+                                Text(settings.mosaicRegions.isEmpty
+                                     ? "範囲が未設定です"
+                                     : "\(settings.mosaicRegions.count)件の範囲 ・ \(settings.mosaicStyle.label)")
+                                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.white.opacity(0.7))
+                                Spacer()
+                                Button(action: { controller.isEditingMosaic = true }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "plus.rectangle.on.rectangle")
+                                            .font(.system(size: 10))
+                                        Text("範囲を指定")
+                                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                    }
+                                    .foregroundColor(.white)
+                                    .padding(.vertical, 6)
+                                    .padding(.horizontal, 10)
+                                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange))
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
 

@@ -107,15 +107,38 @@ EasyScreenRecord は、macOS 向けのスマートズーム機能付き画面録
 |------|------|
 | **録画制御** | `startRecording()`, `stopRecording()` による録画ライフサイクル管理 |
 | **ストリーム処理** | ScreenCaptureKit の `SCStream` を使用した画面キャプチャ |
-| **エンコード** | AVAssetWriter による H.264/MOV 形式でのビデオ書き込み |
+| **エンコード** | `FrameCompositor` 経由で AVAssetWriter に H.264/MOV 形式で書き込み |
 | **ズーム処理** | カーソル追従とスムーズなズームイン/アウト |
 | **ウィンドウ管理** | オーバーレイウィンドウとディミングウィンドウの制御 |
 
 #### スレッド安全性
 
-- `writingQueue`: AVAssetWriter への書き込み専用シリアルキュー
-- すべてのバッファ操作は専用キューで実行
+- `FrameCompositor.sampleQueue`: フレーム受信・合成・書き込み専用のシリアルキュー
+- ズーム位置やモザイク設定は `CompositorState` としてロック付きで受け渡し（メインスレッドは値を差し替えるだけ）
 - 状態遷移時の競合を防止
+
+### 1.5 FrameCompositor / MosaicRenderer (Model)
+
+**ファイル**: `Models/MosaicProcessor.swift`
+
+ScreenCaptureKit はディスプレイ全体をネイティブ解像度で固定キャプチャし、ズームとモザイクは Core Image で後処理します。
+
+```
+SCStream (全画面) ──▶ 最新フレームを保持
+                          │  (フレームレート間隔のタイマー)
+                          ▼
+              1. モザイク適用（ディスプレイ座標）
+              2. ズーム領域 (sourceRect) を切り出し
+              3. 出力サイズにアスペクトフィット
+                          │
+                          ▼
+                 AVAssetWriter (CFR)
+```
+
+- モザイクを切り出しより**前**に適用するため、ズーム・パン中もモザイクがずれず、隠した内容が漏れない
+- 画面に変化がなくてもタイマーでフレームを出力するので、ズームアニメーションが滑らかな固定フレームレート動画になる
+- 出力解像度は録画範囲 × Retina スケール（H.264 上限 4096×2304 に収まるよう縮小）
+- モザイク範囲（`MosaicRegion`）は範囲選択と同じディスプレイローカル座標（左上原点・ポイント）で保持し、UserDefaults に保存
 
 ### 2. RecorderViewModel (ViewModel)
 
@@ -195,7 +218,7 @@ NSWindow座標系 (グローバル)
          │
          ├──▶ SCStream を初期化
          │
-         ├──▶ AVAssetWriter を初期化
+         ├──▶ FrameCompositor (AVAssetWriter) を初期化
          │
          ├──▶ オーバーレイウィンドウを表示
          │
@@ -203,7 +226,7 @@ NSWindow座標系 (グローバル)
          │
          ▼
 4. フレーム受信ループ開始
-   SCStreamDelegate → writingQueue → AVAssetWriter
+   SCStream → FrameCompositor (モザイク → 切り出し) → AVAssetWriter
 ```
 
 ### スマートズームフロー
@@ -225,7 +248,7 @@ NSWindow座標系 (グローバル)
    - スケールのスムージング
          │
          ▼
-5. フレームにズーム適用
+5. CompositorState.sourceRect を更新（FrameCompositor が切り出しに使用）
 ```
 
 ## ファイル構成
@@ -235,7 +258,9 @@ EasyScreenRecord/
 ├── EasyScreenRecord/
 │   ├── Models/
 │   │   ├── ScreenRecorder.swift      # 録画エンジン (1,092行)
-│   │   ├── ZoomSettings.swift        # ズーム設定モデル
+│   │   ├── ZoomSettings.swift        # ズーム・モザイク設定モデル
+│   │   ├── MosaicRegion.swift        # モザイク範囲・スタイル
+│   │   ├── MosaicProcessor.swift     # フレーム合成（モザイク・ズーム切り出し・書き込み）
 │   │   └── AccessibilityUtils.swift  # カーソル検出ユーティリティ
 │   │
 │   ├── ViewModels/
@@ -244,7 +269,8 @@ EasyScreenRecord/
 │   ├── Views/
 │   │   ├── EasyScreenRecordApp.swift # アプリエントリポイント
 │   │   ├── ContentView.swift         # メインUI
-│   │   ├── RegionSelectorView.swift  # 範囲選択UI (629行)
+│   │   ├── RegionSelectorView.swift  # 範囲選択UI
+│   │   ├── MosaicOverlayViews.swift  # モザイク範囲エディタ・録画中の枠表示
 │   │   └── RecordingOverlayView.swift # ズームインジケーター
 │   │
 │   └── Assets.xcassets/              # アイコン・カラー
