@@ -112,6 +112,26 @@ struct MenuBarContentView: View {
                 }
             }
 
+            // Mosaic
+            Button {
+                viewModel.recorder.zoomSettings.mosaicEnabled.toggle()
+            } label: {
+                HStack {
+                    Label("モザイク (\(viewModel.recorder.zoomSettings.mosaicRegions.count)件)", systemImage: "square.grid.3x3.fill")
+                    Spacer()
+                    if viewModel.recorder.zoomSettings.mosaicEnabled {
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+
+            Button {
+                viewModel.editMosaicRegions()
+            } label: {
+                Label("モザイク範囲を設定...", systemImage: "plus.rectangle.on.rectangle")
+            }
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+
             Button {
                 viewModel.recorder.zoomSettings.subtitlesEnabled.toggle()
             } label: {
@@ -219,6 +239,15 @@ struct MenuBarContentView: View {
             .keyboardShortcut(",", modifiers: .command)
         }
 
+        // Reveal last recording
+        if let lastURL = viewModel.recorder.lastRecordingURL {
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([lastURL])
+            } label: {
+                Label("直前の録画を表示", systemImage: "film")
+            }
+        }
+
         // Open Output Folder (always available)
         Button {
             let url = viewModel.recorder.zoomSettings.effectiveOutputDirectory
@@ -229,7 +258,7 @@ struct MenuBarContentView: View {
 
         Divider()
 
-        Button("Quit EasyRecord") {
+        Button("Quit EasyScreenRecord") {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q", modifiers: .command)
@@ -277,7 +306,7 @@ struct SettingsWindowView: View {
                     .padding()
             }
         }
-        .frame(width: 340, height: 480)
+        .frame(width: 360, height: 560)
         .background(VisualEffectView(material: .hudWindow, blendingMode: .behindWindow).ignoresSafeArea())
     }
 }

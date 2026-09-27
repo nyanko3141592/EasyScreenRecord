@@ -289,6 +289,51 @@ struct ZoomSettingsView: View {
                 }
             }
 
+            // モザイク
+            Section {
+                Toggle("モザイクを有効にする", isOn: $settings.mosaicEnabled)
+
+                LabeledContent("スタイル") {
+                    Picker("", selection: $settings.mosaicStyle) {
+                        ForEach(MosaicStyle.allCases, id: \.self) { style in
+                            Text(style.label).tag(style)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 200)
+                }
+
+                if settings.mosaicStyle != .fill {
+                    LabeledContent("粗さ") {
+                        HStack {
+                            Slider(value: $settings.mosaicBlockSize, in: 6...48, step: 2)
+                                .frame(width: 100)
+                            Text("\(Int(settings.mosaicBlockSize))pt")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .frame(width: 36, alignment: .trailing)
+                        }
+                    }
+                }
+
+                LabeledContent("範囲") {
+                    HStack {
+                        Text("\(settings.mosaicRegions.count)件")
+                            .foregroundStyle(.secondary)
+                        Button("すべて削除") {
+                            settings.mosaicRegions.removeAll()
+                        }
+                        .disabled(settings.mosaicRegions.isEmpty)
+                    }
+                }
+            } header: {
+                Text("モザイク")
+            } footer: {
+                Text("範囲はメニューの「モザイク範囲を設定...」または録画範囲の選択画面で指定します。モザイクは録画ファイルにのみ焼き込まれ、画面上では枠だけが表示されます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             // 録画
             Section {
                 LabeledContent("保存先") {
@@ -425,7 +470,7 @@ struct ZoomSettingsView: View {
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
-        .frame(maxHeight: 400)
+        .frame(maxHeight: 480)
     }
 
     private var presetName: String {

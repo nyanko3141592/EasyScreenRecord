@@ -125,6 +125,52 @@ class ZoomSettings: ObservableObject {
     /// How long to show subtitle after typing stops (seconds)
     @Published var subtitleDisplayDuration: TimeInterval = 2.0
 
+    // MARK: - Mosaic Settings
+    /// Apply mosaic to the registered regions while recording
+    @Published var mosaicEnabled: Bool = true { didSet { saveMosaic() } }
+
+    /// Screen areas to mask (display-local points, top-left origin)
+    @Published var mosaicRegions: [MosaicRegion] = [] { didSet { saveMosaic() } }
+
+    /// Mosaic block size in screen points
+    @Published var mosaicBlockSize: CGFloat = 16 { didSet { saveMosaic() } }
+
+    @Published var mosaicStyle: MosaicStyle = .pixelate { didSet { saveMosaic() } }
+
+    /// Whether mosaic will actually be applied to the next recording
+    var isMosaicActive: Bool { mosaicEnabled && !mosaicRegions.isEmpty }
+
+    private enum MosaicKeys {
+        static let enabled = "mosaic.enabled"
+        static let regions = "mosaic.regions"
+        static let blockSize = "mosaic.blockSize"
+        static let style = "mosaic.style"
+    }
+
+    init() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: MosaicKeys.enabled) != nil {
+            mosaicEnabled = defaults.bool(forKey: MosaicKeys.enabled)
+        }
+        if let data = defaults.data(forKey: MosaicKeys.regions),
+           let regions = try? JSONDecoder().decode([MosaicRegion].self, from: data) {
+            mosaicRegions = regions
+        }
+        let block = defaults.double(forKey: MosaicKeys.blockSize)
+        if block > 0 { mosaicBlockSize = block }
+        if let style = MosaicStyle(rawValue: defaults.integer(forKey: MosaicKeys.style)) {
+            mosaicStyle = style
+        }
+    }
+
+    private func saveMosaic() {
+        let defaults = UserDefaults.standard
+        defaults.set(mosaicEnabled, forKey: MosaicKeys.enabled)
+        defaults.set(try? JSONEncoder().encode(mosaicRegions), forKey: MosaicKeys.regions)
+        defaults.set(Double(mosaicBlockSize), forKey: MosaicKeys.blockSize)
+        defaults.set(mosaicStyle.rawValue, forKey: MosaicKeys.style)
+    }
+
     // MARK: - Reset
     func resetToDefaults() {
         zoomMode = .scale
@@ -157,6 +203,10 @@ class ZoomSettings: ObservableObject {
         subtitlePosition = 0
         subtitleBackgroundOpacity = 0.7
         subtitleDisplayDuration = 2.0
+        mosaicEnabled = true
+        mosaicBlockSize = 16
+        mosaicStyle = .pixelate
+        // outputDirectory and mosaicRegions are not reset (user data)
         // outputDirectory is not reset (user preference)
     }
 
